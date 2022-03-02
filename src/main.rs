@@ -208,9 +208,6 @@ async fn main() -> std::io::Result<()> {
     let from: DateTime<Utc> = opts.from.parse().expect("Couldn't parse 'from' date");
     let to = Utc::now();
 
-    // a simple way to output a CSV header
-    println!("period start,symbol,price,change %,min,max,30d avg");
-
     let results = join_all(
         opts.symbols
             .split(",")
