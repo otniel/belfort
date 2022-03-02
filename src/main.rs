@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use chrono::prelude::*;
+use futures::future::join_all;
 use clap::Parser;
 use std::io::{Error, ErrorKind};
 use yahoo_finance_api as yahoo;
@@ -16,6 +17,43 @@ struct Opts {
     #[clap(short, long)]
     from: String,
 }
+
+struct StockData<'a> {
+    symbol: &'a str,
+    last_price: f64,
+    pct_change: f64,
+    period_min: f64,
+    period_max: f64,
+    thirty_day_avg: f64,
+}
+
+impl<'a> StockData<'a> {
+    async fn new(symbol: &'a str, closes: Vec<f64>) -> StockData<'a> {
+        let period_max: f64 = MaxPrice.calculate(&closes).await.unwrap();
+        let period_min: f64 = MinPrice.calculate(&closes).await.unwrap();
+        let last_price = *closes.last().unwrap_or(&0.0);
+
+        let (_, pct_change) = PriceDifference
+            .calculate(&closes)
+            .await
+            .unwrap_or((0.0, 0.0));
+
+        let signal = WindowedSMA { window_size: 30 };
+        let sma = signal.calculate(&closes).await.unwrap_or_default();
+
+        let thirty_day_avg = *sma.last().unwrap_or(&0.0);
+
+        StockData {
+            symbol,
+            last_price,
+            pct_change,
+            period_min,
+            period_max,
+            thirty_day_avg
+        }
+    }
+}
+
 
 ///
 /// A trait to provide a common interface for all signal calculations.
@@ -63,6 +101,16 @@ async fn fetch_closing_data(
     } else {
         Ok(vec![])
     }
+}
+
+async fn fetch_stock_data<'a>(
+    symbol: &'a str,
+    from: &DateTime<Utc>,
+    to: &DateTime<Utc>,
+) -> std::io::Result<StockData<'a>> {
+    let closes = fetch_closing_data(symbol, &from, &to).await?;
+    let stats = StockData::new(symbol, closes).await;
+    Ok(stats)
 }
 
 struct PriceDifference;
@@ -163,34 +211,29 @@ async fn main() -> std::io::Result<()> {
     // a simple way to output a CSV header
     println!("period start,symbol,price,change %,min,max,30d avg");
 
-    for symbol in opts.symbols.split(',') {
-        let closes = fetch_closing_data(symbol, &from, &to).await?;
-        if !closes.is_empty() {
-            let period_max: f64 = MaxPrice.calculate(&closes).await.unwrap();
-            let period_min: f64 = MinPrice.calculate(&closes).await.unwrap();
-            let last_price = *closes.last().unwrap_or(&0.0);
+    let results = join_all(
+        opts.symbols
+            .split(",")
+            .map(|s| fetch_stock_data(s, &from, &to)),
+    )
+    .await;
 
-            let (_, pct_change) = PriceDifference
-                .calculate(&closes)
-                .await
-                .unwrap_or((0.0, 0.0));
+    let stock_stats: Vec<_> = results.into_iter().filter_map(|r| r.ok()).collect();
 
-            let signal = WindowedSMA { window_size: 30 };
-            let sma = signal.calculate(&closes).await.unwrap_or_default();
-
-            // a simple way to output CSV data
-            println!(
-                "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
-                from.to_rfc3339(),
-                symbol,
-                last_price,
-                pct_change * 100.0,
-                period_min,
-                period_max,
-                sma.last().unwrap_or(&0.0)
-            );
-        }
+    println!("period start,symbol,price,change %,min,max,30d avg");
+    for stats in stock_stats {
+        println!(
+            "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
+            from.to_rfc3339(),
+            stats.symbol,
+            stats.last_price,
+            stats.pct_change,
+            stats.period_min,
+            stats.period_max,
+            stats.thirty_day_avg,
+        )
     }
+
     Ok(())
 }
 
