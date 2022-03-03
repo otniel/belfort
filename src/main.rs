@@ -1,8 +1,10 @@
+use async_std::stream;
 use async_trait::async_trait;
 use chrono::prelude::*;
-use futures::future::join_all;
 use clap::Parser;
+use futures::stream::{FuturesUnordered, StreamExt};
 use std::io::{Error, ErrorKind};
+use std::time::Duration;
 use yahoo_finance_api as yahoo;
 
 #[derive(Parser, Debug)]
@@ -49,11 +51,10 @@ impl<'a> StockData<'a> {
             pct_change,
             period_min,
             period_max,
-            thirty_day_avg
+            thirty_day_avg,
         }
     }
 }
-
 
 ///
 /// A trait to provide a common interface for all signal calculations.
@@ -108,7 +109,7 @@ async fn fetch_stock_data<'a>(
     from: &DateTime<Utc>,
     to: &DateTime<Utc>,
 ) -> std::io::Result<StockData<'a>> {
-    let closes = fetch_closing_data(symbol, &from, &to).await?;
+    let closes = fetch_closing_data(symbol, from, to).await?;
     let stats = StockData::new(symbol, closes).await;
     Ok(stats)
 }
@@ -202,37 +203,50 @@ impl AsyncStockSignal for WindowedSMA {
     }
 }
 
-#[tokio::main]
-async fn main() -> std::io::Result<()> {
+async fn execute() {
     let opts = Opts::parse();
     let from: DateTime<Utc> = opts.from.parse().expect("Couldn't parse 'from' date");
     let to = Utc::now();
 
-    let results = join_all(
-        opts.symbols
-            .split(",")
-            .map(|s| fetch_stock_data(s, &from, &to)),
-    )
-    .await;
-
-    let stock_stats: Vec<_> = results.into_iter().filter_map(|r| r.ok()).collect();
+    let mut stock_futures = opts
+        .symbols
+        .split(',')
+        .map(|s| fetch_stock_data(s, &from, &to))
+        .collect::<FuturesUnordered<_>>();
 
     println!("period start,symbol,price,change %,min,max,30d avg");
-    for stats in stock_stats {
-        println!(
-            "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
-            from.to_rfc3339(),
-            stats.symbol,
-            stats.last_price,
-            stats.pct_change,
-            stats.period_min,
-            stats.period_max,
-            stats.thirty_day_avg,
-        )
+    while let Some(result) = stock_futures.next().await {
+        if let Ok(stock_data) = result {
+            print_stock_data(from, stock_data);
+        }
+    }
+}
+
+fn print_stock_data(from: DateTime<Utc>, stock_data: StockData) {
+    println!(
+        "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
+        from.to_rfc3339(),
+        stock_data.symbol,
+        stock_data.last_price,
+        stock_data.pct_change,
+        stock_data.period_min,
+        stock_data.period_max,
+        stock_data.thirty_day_avg,
+    )
+}
+
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    execute().await; // First execution, then on 30s intervals.
+
+    let mut interval = stream::interval(Duration::from_secs(30));
+    while interval.next().await.is_some() {
+        execute().await
     }
 
     Ok(())
 }
+
 
 #[cfg(test)]
 mod tests {
